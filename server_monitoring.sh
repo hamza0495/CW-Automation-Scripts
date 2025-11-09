@@ -3,81 +3,114 @@
 # Author:  Muhammad Hamza Zaheer
 # Usage: wget https://raw.githubusercontent.com/hamza0495/CW-Automation-Scripts/server_monitoring.sh
 
-set -e
-cd /home/master/applications/
-date_to_check=$1
-time_in_UTC=$2
-interval_in_mins=$3
+set -euo pipefail
 
-# Adding option to select interval (days/hr/mins)
-iv=$4
+LOGFILE="/home/master/server_diagnostic_$(date +%F_%H-%M).log"
+exec > >(tee -a "$LOGFILE") 2>&1
 
-# Function to fetch stats for a particular time duration
-get_stats(){
-dd=$(echo $date_to_check | cut -d '/' -f1);
-mm=$(echo $date_to_check | cut -d '/' -f2);
-yy=$(echo $date_to_check | cut -d '/' -f3);
+echo -e "\n👋 Hi, how may I help you?\n"
+echo "1. High CPU/RAM Usage on the Server"
+echo "2. Applications/Websites taking ages to load"
+echo "3. Experiencing an issue on a specific app?"
+echo "4. Server keeps going down (OOM / crash check)"
+echo
+read -p "Enter option [1-4]: " choice
 
-# Convert input date to m/d/y format
-date_new="$mm/$dd/$yy"
-
-time_a="$date_to_check:$time_in_UTC"
-time_b=$(date --date="$date_new $time_in_UTC UTC $interval_in_mins $iv" -u +'%d/%m/%Y:%H:%M');
-time_op=$(echo $interval_in_mins |  cut -c1-1);
-
-if [[ "$time_op" = "-" ]];
-then
-        from_param=$time_b;
-        until_param=$time_a;
-elif [[ "$time_op" = "+" ]];
-then
-        from_param=$time_a;
-        until_param=$time_b;
-fi
-
-# echo $'\n' $(tput setaf 3) ---------- APPLICATION MONITORING STATS ---------- $(tput setaf 7)$'\n'
-echo Stats from $(tput setaf 3)$from_param $(tput setaf 7)to $(tput setaf 3)$until_param $(tput setaf 7)$'\n'
-top_five=$(for i in $(ls -l | grep -v ^l | awk '{print $NF}' | awk 'FNR > 1'); do count=$(sudo apm -s $i traffic --statuses -f $from_param -u $until_param -j | grep -Po "\d..\",\d*" | cut -d ',' -f2 | head -n1); echo $i:$count ; done | sort -k2 -nr -t ":" | cut -d : -f 1 | head -n 5);
-for A in $top_five; do
-        echo $'\n'DB: $(tput setaf 3)$A $(tput setaf 7);
-        cat $A/conf/server.nginx | awk '{print $NF}' | head -n1;
-        sudo apm -s $A traffic -n5 -f $from_param -u $until_param;
-        sudo apm -s $A mysql -n5 -f $from_param -u $until_param;
-        sudo apm -s $A php -n5 --slow_pages -f $from_param -u $until_param;
-        done
+# === Function: High CPU/RAM Usage ===
+check_cpu_ram() {
+    echo -e "\n🔍 Checking CPU and RAM usage...\n"
+    echo "Top 10 processes by CPU and memory:"
+    ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -n 11
+    echo
+    echo "Memory summary:"
+    free -h
+    echo
+    echo "Load average:"
+    uptime
+    echo
+    echo "Disk space:"
+    df -h /
+    echo
+    echo "Running apm info for server:"
+    sudo apm info || echo "⚠️ Unable to fetch APM info"
 }
 
+# === Function: Apps/Websites Loading Slowly ===
+check_apps_slow() {
+    echo -e "\n🔍 Checking web server logs for resource issues...\n"
+    tail -n 15 /var/log/apache2/error.log | grep -E "AH03104|unable to create worker thread" && {
+        echo -e "\n🚨 Apache worker thread exhaustion detected!"
+        echo "Recommendation: Ask senior to increase worker threads."
+    } || echo "✅ No Apache worker exhaustion errors found."
 
-if [ -z $date_to_check ] && [ -z $time_in_UTC ] && [ -z $interval_in_mins ] && [ -z $iv ];
-  then
-    read -p 'Enter duration: ' dur
-    # echo $'\n' $(tput setaf 3) ---------- APPLICATION MONITORING STATS ---------- $(tput setaf 7)$'\n'
-    echo "Fetching logs for the last$(tput setaf 1) $dur$(tput setaf 7) ...";
-    top_five=$(for i in $(ls -l | grep -v ^l | awk '{print $NF}' | awk 'FNR > 1'); do count=$(sudo apm -s $i traffic --statuses -l $dur -j | grep -Po "\d..\",\d*" | cut -d ',' -f2 | head -n1); echo $i:$count ; done | sort -k2 -nr -t ":" | cut -d : -f 1 | head -n 5);
-    for A in $top_five; do
-        echo $'\n'DB: $(tput setaf 3)$A $(tput setaf 7);
-        cat $A/conf/server.nginx | awk '{print $NF}' | head -n1;
-        sudo apm traffic -s $A -l $dur -n5;
-        sudo apm mysql -s $A -l $dur -n5;
-        sudo apm php -s $A --slow_pages -l $dur -n5;
-        slow_plugins=$(cat /home/master/applications/$A/logs/php-app.slow.log | grep -ai 'wp-content/plugins' | cut -d " " -f1 --complement | cut -d '/' -f8 | sort | uniq -c | sort -nr);
-        if [ -n "$slow_plugins" ]; then
-        echo $'\n'$(tput setaf 1) --- Slow plugins --- $(tput setaf 7)$'\n';
-        while IFS= read -r line; do
-            echo "$line"
-        done <<< "$slow_plugins"
-        echo $'\n'$(tput setaf 1) -------------------- $(tput setaf 7);
-        fi
-        done;
+    echo -e "\n📊 Checking top slow applications using APM...\n"
+    cd /home/master/applications/
+    for app in */; do
+        app=${app%/}
+        echo -e "\nApp: $app"
+        sudo apm -s "$app" php -n3 --slow_pages -l 30min
+        sudo apm -s "$app" mysql -n3 -l 30min
+        echo
+    done
+}
 
-elif [ -z $iv ]
-  then
-    # Setting interval to mins if empty
-    iv="min";
-    get_stats;
-  else
-    get_stats;
-fi;
+# === Function: Specific Application ===
+check_specific_app() {
+    read -p "Enter Application Name: " app
+    cd /home/master/applications/ || exit
+    if [ ! -d "$app" ]; then
+        echo "❌ App '$app' not found!"
+        exit 1
+    fi
+    echo -e "\n🔍 Checking $app performance (APM & logs)..."
+    sudo apm -s "$app" traffic -l 30min -n5
+    sudo apm -s "$app" php --slow_pages -l 30min -n5
+    sudo apm -s "$app" mysql -l 30min -n5
 
-rm server_monitoring.sh;
-exit;
+    slow_plugins=$(grep -ai 'wp-content/plugins' "$app/logs/php-app.slow.log" 2>/dev/null | cut -d '/' -f8 | sort | uniq -c | sort -nr)
+    if [ -n "$slow_plugins" ]; then
+        echo -e "\n🚨 Slow plugins detected:\n$slow_plugins"
+    else
+        echo -e "\n✅ No slow plugins found."
+    fi
+}
+
+# === Function: Server Keeps Going Down (OOM check) ===
+check_oom() {
+    echo -e "\n🔍 Checking syslog for Out-Of-Memory errors...\n"
+    tail -n 50 /var/log/syslog | grep -i 'oom' && {
+        echo -e "\n🚨 OOM killer detected! A process used excessive memory."
+        echo "Check which process caused it and optimize or restart services."
+    } || echo "✅ No recent OOM events found."
+}
+
+# === Optional: AI-powered Insights (Gemini integration) ===
+analyze_with_gemini() {
+    if [ -z "${GEMINI_API_KEY:-}" ]; then
+        echo "⚠️ Gemini API key not set. Skipping AI analysis."
+        return
+    fi
+
+    echo -e "\n🤖 Sending last 50 log lines to Gemini for insights..."
+    response=$(curl -s -X POST \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $GEMINI_API_KEY" \
+      -d "{\"contents\": [{\"parts\": [{\"text\": \"Analyze these logs for performance or configuration issues: $(tail -n 50 $LOGFILE)\"}]}]}" \
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent")
+
+    echo "$response" | jq -r '.candidates[0].content.parts[0].text' || echo "No Gemini insights found."
+}
+
+# === Menu Handler ===
+case $choice in
+    1) check_cpu_ram ;;
+    2) check_apps_slow ;;
+    3) check_specific_app ;;
+    4) check_oom ;;
+    *) echo "Invalid option."; exit 1 ;;
+esac
+
+# Uncomment below if you want Gemini AI summary after every check:
+# analyze_with_gemini
+
+echo -e "\n✅ All done! Log saved at: $LOGFILE"

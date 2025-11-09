@@ -79,5 +79,5 @@ elif [ -z $iv ]
     get_stats;
 fi;
 
-rm apm.sh;
+rm server_monitoring.sh;
 exit;
